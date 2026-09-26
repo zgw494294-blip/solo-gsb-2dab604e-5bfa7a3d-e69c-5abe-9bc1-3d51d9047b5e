@@ -740,6 +740,35 @@ def test_heat_exposure_no_readings_covers_nothing(client):
     assert body["excess_degree_seconds"] == 0.0
 
 
+def test_heat_exposure_extreme_temperatures_stay_finite(client):
+    # Legitimate finite extremes: -1e308 at 00:00:00, +1e308 at 00:00:01
+    # (M=1s). The ramp crosses T=0 at the midpoint; the endpoint difference
+    # 2e308 overflows the slope form, but the results must stay finite.
+    set_thresholds(client)
+    set_sampling(client, max_interval=1, grace=0)
+    post_readings(
+        client,
+        [("2026-01-01T00:00:00+00:00", -1e308), ("2026-01-01T00:00:01+00:00", 1e308)],
+    )
+    resp = get_heat(client, "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:01+00:00", 0.0)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["covered_seconds"] == 1.0
+    assert body["above_seconds"] == 0.5
+    # triangle: (1e308 - 0) * 0.5 s / 2 = 2.5e307 degree-seconds
+    assert body["excess_degree_seconds"] == 2.5e307
+
+    # The downward extreme ramp is symmetric: above for the first half.
+    post_readings(
+        client,
+        [("2026-01-01T00:00:00+00:00", 1e308), ("2026-01-01T00:00:01+00:00", -1e308)],
+    )
+    body = get_heat(client, "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:01+00:00", 0.0).json()
+    assert body["covered_seconds"] == 1.0
+    assert body["above_seconds"] == 0.5
+    assert body["excess_degree_seconds"] == 2.5e307
+
+
 # ------------------------------------------------------------ freshness & UTC
 
 def test_heat_exposure_late_arrival_fills_gap(client):

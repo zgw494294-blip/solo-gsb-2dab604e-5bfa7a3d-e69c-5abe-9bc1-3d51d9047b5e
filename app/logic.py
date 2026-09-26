@@ -327,23 +327,37 @@ def _segment_above(
     segment crosses ``baseline`` it is split at the crossing instant:
     only the part strictly above T counts, and the excess integral of
     that part is the trapezoidal area of (temperature - T).
+
+    Every temperature difference is evaluated on halved values
+    (``0.5 * a - 0.5 * b`` instead of ``a - b``): halving is exact, and
+    the difference of two halved finite floats can never overflow, so
+    legitimate extreme readings (e.g. -1e308 -> 1e308 around the
+    baseline) still yield finite results instead of inf/NaN.
     """
     total = (t1 - t0).total_seconds()
     above0, above1 = v0 > baseline, v1 > baseline
     if not above0 and not above1:
         return 0.0, 0.0
+    # Half of each endpoint's excess over the baseline: (v - T) / 2,
+    # computed as 0.5*v - 0.5*T so it stays finite for any finite v, T.
+    half_excess0 = 0.5 * v0 - 0.5 * baseline
+    half_excess1 = 0.5 * v1 - 0.5 * baseline
     if above0 and above1:
-        duration = total
-        excess = 0.5 * ((v0 - baseline) + (v1 - baseline)) * total
-        return duration, excess
+        # Trapezoid 0.5 * ((v0 - T) + (v1 - T)) * total, distributed so no
+        # intermediate overflows unless the true result itself does.
+        return total, total * half_excess0 + total * half_excess1
 
     # Exactly one endpoint above T: split at the (unique) crossing point.
-    # The above part is a triangle in (temperature - T); the base fraction
-    # is f when t0 is above, (1 - f) when t1 is above.
-    f = (baseline - v0) / (v1 - v0)  # fraction of the segment from t0 to the crossing
+    # f is the fraction of the segment from t0 to the crossing; halving
+    # both endpoint differences keeps the ratio unchanged and finite.
+    # The above part is a triangle in (temperature - T): its area is the
+    # above endpoint's half excess times the above time.
+    f = (0.5 * baseline - 0.5 * v0) / (0.5 * v1 - 0.5 * v0)
     if above0:
-        return f * total, 0.5 * abs(v1 - v0) * total * f**2
-    return (1.0 - f) * total, 0.5 * abs(v1 - v0) * total * (1.0 - f) ** 2
+        above_time = f * total
+        return above_time, half_excess0 * above_time
+    above_time = (1.0 - f) * total
+    return above_time, half_excess1 * above_time
 
 
 def compute_heat_exposure(
@@ -371,6 +385,13 @@ def compute_heat_exposure(
     split at the crossing so above-time and the excess degree-second
     integral (trapezoid of temperature - T) count only the part above T.
 
+    Interpolated boundary temperatures are convex combinations of the two
+    endpoint readings (weights in [0, 1]) rather than the slope form
+    ``v0 + (v1 - v0) * fraction``: the slope overflows to +-inf whenever
+    the endpoint difference exceeds the float range (legitimate extremes
+    such as -1e308 -> 1e308), which used to turn the results into NaN.
+    The convex form stays finite for any finite endpoint temperatures.
+
     Pure function of current data: corrections, late arrivals and M
     changes simply change the inputs, so the next query sees them.
     """
@@ -394,10 +415,18 @@ def compute_heat_exposure(
 
         duration = (c_end - c_start).total_seconds()
         covered += duration
-        span = (t1 - t0).total_seconds()
-        a = (v1 - v0) / span
-        cv0 = v0 + a * (c_start - t0).total_seconds()
-        cv1 = v0 + a * (c_end - t0).total_seconds()
+        if v0 == v1:
+            cv0 = cv1 = v0  # constant segment: the exact endpoint value
+        else:
+            # Convex combination with weights in [0, 1]: finite for any
+            # finite endpoint temperatures, however extreme (the slope
+            # form v0 + (v1 - v0) * f overflows to inf/NaN when the
+            # endpoint difference exceeds the float range).
+            span = (t1 - t0).total_seconds()
+            f_start = (c_start - t0).total_seconds() / span
+            f_end = (c_end - t0).total_seconds() / span
+            cv0 = v0 * (1.0 - f_start) + v1 * f_start
+            cv1 = v0 * (1.0 - f_end) + v1 * f_end
         seg_above, seg_excess = _segment_above(c_start, cv0, c_end, cv1, baseline)
         above += seg_above
         excess += seg_excess
