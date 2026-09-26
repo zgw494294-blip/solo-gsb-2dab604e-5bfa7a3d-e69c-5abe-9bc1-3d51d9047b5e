@@ -327,23 +327,37 @@ def _segment_above(
     segment crosses ``baseline`` it is split at the crossing instant:
     only the part strictly above T counts, and the excess integral of
     that part is the trapezoidal area of (temperature - T).
+
+    Temperature differences are evaluated on halved values (x / 2 is
+    exact in binary floating point), so legitimate finite extremes whose
+    raw difference would overflow a float64 — adjacent readings of
+    -1e308 and +1e308 across the baseline — still yield a finite
+    crossing fraction and a finite area instead of inf/NaN.
     """
     total = (t1 - t0).total_seconds()
     above0, above1 = v0 > baseline, v1 > baseline
     if not above0 and not above1:
         return 0.0, 0.0
+    half_b = baseline / 2
     if above0 and above1:
-        duration = total
-        excess = 0.5 * ((v0 - baseline) + (v1 - baseline)) * total
-        return duration, excess
+        # Trapezoid of (temperature - T): 0.5 * ((v0 - T) + (v1 - T)) * total,
+        # summed as (v0/2 - T/2) * total + (v1/2 - T/2) * total so the
+        # intermediate temperature differences cannot overflow.
+        excess = (v0 / 2 - half_b) * total + (v1 / 2 - half_b) * total
+        return total, excess
 
     # Exactly one endpoint above T: split at the (unique) crossing point.
-    # The above part is a triangle in (temperature - T); the base fraction
-    # is f when t0 is above, (1 - f) when t1 is above.
-    f = (baseline - v0) / (v1 - v0)  # fraction of the segment from t0 to the crossing
+    # The crossing fraction is computed on halved values because v1 - v0
+    # itself can overflow. The above part is a triangle in
+    # (temperature - T) with base fraction f (t0 above) or (1 - f)
+    # (t1 above) and height (v_above - T); 0.5 * height * base is
+    # (v_above/2 - T/2) * base.
+    f = (half_b - v0 / 2) / (v1 / 2 - v0 / 2)  # fraction of the segment from t0 to the crossing
     if above0:
-        return f * total, 0.5 * abs(v1 - v0) * total * f**2
-    return (1.0 - f) * total, 0.5 * abs(v1 - v0) * total * (1.0 - f) ** 2
+        base = f * total
+        return base, (v0 / 2 - half_b) * base
+    base = (1.0 - f) * total
+    return base, (v1 / 2 - half_b) * base
 
 
 def compute_heat_exposure(
@@ -371,6 +385,11 @@ def compute_heat_exposure(
     split at the crossing so above-time and the excess degree-second
     integral (trapezoid of temperature - T) count only the part above T.
 
+    Interpolation, crossing location and area evaluation all use
+    overflow-safe forms (convex combinations and halved differences), so
+    legitimate finite extreme temperatures (e.g. -1e308 next to +1e308)
+    still yield finite results instead of inf/NaN.
+
     Pure function of current data: corrections, late arrivals and M
     changes simply change the inputs, so the next query sees them.
     """
@@ -395,9 +414,13 @@ def compute_heat_exposure(
         duration = (c_end - c_start).total_seconds()
         covered += duration
         span = (t1 - t0).total_seconds()
-        a = (v1 - v0) / span
-        cv0 = v0 + a * (c_start - t0).total_seconds()
-        cv1 = v0 + a * (c_end - t0).total_seconds()
+        f0 = (c_start - t0).total_seconds() / span
+        f1 = (c_end - t0).total_seconds() / span
+        # Convex combination of the endpoint temperatures: finite for any
+        # finite v0/v1, unlike v0 + (v1 - v0) * f, whose difference can
+        # overflow a float64 for legitimate finite extremes.
+        cv0 = v0 * (1.0 - f0) + v1 * f0
+        cv1 = v0 * (1.0 - f1) + v1 * f1
         seg_above, seg_excess = _segment_above(c_start, cv0, c_end, cv1, baseline)
         above += seg_above
         excess += seg_excess

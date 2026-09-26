@@ -740,6 +740,61 @@ def test_heat_exposure_no_readings_covers_nothing(client):
     assert body["excess_degree_seconds"] == 0.0
 
 
+# ------------------------------------------------------------ extreme values
+
+def test_heat_exposure_extreme_temperatures_stay_finite(client):
+    # M=1s; adjacent readings -1e308 -> +1e308 over 1 s cross T=0 at the
+    # midpoint. The interpolation/crossing arithmetic must not overflow to
+    # inf/NaN: covered=1, above=0.5, excess = triangle 0.5s * 1e308 / 2.
+    set_thresholds(client)
+    set_sampling(client, max_interval=1, grace=0)
+    post_readings(
+        client,
+        [("2026-01-01T00:00:00+00:00", -1e308), ("2026-01-01T00:00:01+00:00", 1e308)],
+    )
+    resp = get_heat(client, "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:01+00:00", 0.0)
+    assert resp.status_code == 200  # finite floats: the body is valid JSON
+    body = resp.json()
+    assert body["covered_seconds"] == 1.0
+    assert body["above_seconds"] == 0.5
+    assert body["excess_degree_seconds"] == 2.5e307
+
+
+def test_heat_exposure_extreme_temperatures_downward_crossing(client):
+    # Same extremes ramping down: the crossing split must stay finite too.
+    set_thresholds(client)
+    set_sampling(client, max_interval=1, grace=0)
+    post_readings(
+        client,
+        [("2026-01-01T00:00:00+00:00", 1e308), ("2026-01-01T00:00:01+00:00", -1e308)],
+    )
+    body = get_heat(client, "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:01+00:00", 0.0).json()
+    assert body["covered_seconds"] == 1.0
+    assert body["above_seconds"] == 0.5
+    assert body["excess_degree_seconds"] == 2.5e307
+
+
+def test_heat_exposure_extreme_temperatures_clipped_window(client):
+    # The window boundary is interpolated between the extreme readings:
+    # [00:00:00.25, 00:00:00.75] clips the ramp to -5e307 -> +5e307.
+    set_thresholds(client)
+    set_sampling(client, max_interval=1, grace=0)
+    post_readings(
+        client,
+        [("2026-01-01T00:00:00+00:00", -1e308), ("2026-01-01T00:00:01+00:00", 1e308)],
+    )
+    body = get_heat(
+        client,
+        "2026-01-01T00:00:00.250000+00:00",
+        "2026-01-01T00:00:00.750000+00:00",
+        0.0,
+    ).json()
+    assert body["covered_seconds"] == 0.5
+    assert body["above_seconds"] == 0.25
+    # triangle: 0.25 s * 5e307 / 2 = 6.25e306
+    assert body["excess_degree_seconds"] == 6.25e306
+
+
 # ------------------------------------------------------------ freshness & UTC
 
 def test_heat_exposure_late_arrival_fills_gap(client):
